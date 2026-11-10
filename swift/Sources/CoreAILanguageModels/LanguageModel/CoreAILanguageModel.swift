@@ -269,6 +269,14 @@ public struct CoreAILanguageModel: LanguageModel {
                 reasoningEffort: reasoningEffort,
                 component: "CoreAIExecutor"
             )
+            let instructionTokenCount = Self.instructionTokenCount(
+                of: promptTokens,
+                transcript: Array(request.transcript),
+                using: model.tokenizer,
+                tools: request.enabledToolDefinitions,
+                toolCallDetection: model.toolCallDetection,
+                reasoningEffort: reasoningEffort
+            )
             guard !promptTokens.isEmpty else {
                 tokenizationSpan.end()
                 throw LanguageModelError.unsupportedTranscriptContent(
@@ -291,6 +299,9 @@ public struct CoreAILanguageModel: LanguageModel {
             try await resources.withEngine { engine in
                 // FoundationModels now threads entry identity itself based on event
                 // ordering — we no longer mint an entryID and pass it down.
+
+                // Every session over these instructions begins with the same tokens.
+                engine.retainPrefix(length: instructionTokenCount)
 
                 // Check if guided generation is requested
                 if let schema = request.schema {
@@ -326,6 +337,28 @@ public struct CoreAILanguageModel: LanguageModel {
                     )
                 }
             }
+        }
+
+        /// How many leading tokens of `promptTokens` the instructions alone determine: those it shares
+        /// with the same transcript cut down to its instructions. Zero without instructions.
+        static func instructionTokenCount(
+            of promptTokens: [Int],
+            transcript: [Transcript.Entry],
+            using tokenizer: any Tokenizer,
+            tools: [Transcript.ToolDefinition],
+            toolCallDetection: ToolCallDetection?,
+            reasoningEffort: String?
+        ) -> Int {
+            let instructions = transcript.filter {
+                if case .instructions = $0 { return true }
+                return false
+            }
+            guard !instructions.isEmpty else { return 0 }
+            let leading = makeTokens(
+                from: instructions, using: tokenizer, tools: tools,
+                toolCallDetection: toolCallDetection, reasoningEffort: reasoningEffort,
+                component: "CoreAIExecutor")
+            return zip(leading, promptTokens).prefix { $0 == $1 }.count
         }
 
         // MARK: - Vanilla Generation (no schema)

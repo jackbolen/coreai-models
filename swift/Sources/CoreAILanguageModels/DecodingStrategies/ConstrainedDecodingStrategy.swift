@@ -71,8 +71,6 @@ public struct ConstrainedDecodingStrategy: DecodingStrategy {
             .map(Int32.init)
         let maxTokens = options.maxTokens ?? 512
 
-        try await inferenceEngine.reset()
-
         return ConstrainedDecodedSequence(
             prepared: ConstrainedDecodedSequence.Prepared(
                 session: consume session,

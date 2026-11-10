@@ -341,6 +341,23 @@ struct StaticStateSet {
         slidingRing?.allowsRewind(processed: processed, to: target, alignment: alignment) ?? true
     }
 
+    /// The sliding-window ring as it stands, or nil when the asset has none. `NDArray` is
+    /// copy-on-write, so the snapshot shares the ring's storage until the next step writes it.
+    func snapshotRing() -> [String: NDArray]? {
+        guard slidingRing != nil, let fixed else { return nil }
+        var snapshot: [String: NDArray] = [:]
+        for name in [SlidingRing.keyCacheName, SlidingRing.valueCacheName] {
+            guard let array = fixed.arrays[name] else { return nil }
+            snapshot[name] = array
+        }
+        return snapshot
+    }
+
+    /// Puts back a ring taken by ``snapshotRing()``.
+    func restoreRing(_ snapshot: [String: NDArray]) {
+        for (name, array) in snapshot { fixed?.arrays[name] = array }
+    }
+
     /// A state's backing array, from whichever handler owns it; nil when none does. Lets a draft
     /// head read the target's shared K/V in place.
     func stateArray(named name: String) -> NDArray? {

@@ -102,6 +102,24 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private var history = TokenHistory()
     public private(set) var lastPrefixHitCount: Int = 0
 
+    /// The sequence's leading tokens and the sliding ring as it stood after them. A ring cannot be
+    /// rewound far, so without a checkpoint a request that diverges from the history replays every
+    /// token.
+    private struct PrefixCheckpoint {
+        let tokens: [TokenId]
+        let ring: [String: NDArray]
+        /// The `retainPrefix(length:)` this checkpoint was taken for.
+        let requestedLength: Int
+
+        func matches(_ input: [TokenId]) -> Bool {
+            input.count >= tokens.count && input.starts(with: tokens)
+        }
+    }
+
+    private var checkpoint: PrefixCheckpoint?
+    /// Where the next prefill takes a checkpoint, set by `retainPrefix(length:)`.
+    private var retainedPrefixLength: Int?
+
     // Track in-flight generation via token
     private let tokenBox = GenerationTokenBox()
 
@@ -544,15 +562,26 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let commonPrefix = Self.reusablePrefixLength(
                 matchedPrefix: matchedPrefix,
                 firstImagePosition: pendingImageEmbeddings == nil ? nil : imageTokenPositions.min())
-            if let position = Self.resumePosition(
+            let resume = Self.resumePosition(
                 commonPrefix: commonPrefix, inputCount: input.count, historyCount: history.count,
                 processed: processedTokenCount,
                 // The restart may run in any graph, the prefill graphs included.
                 canRewind: { canRewind(to: $0, alignment: maxQueryLength) })
+            if let checkpoint, pendingImageEmbeddings == nil, checkpoint.matches(input),
+                checkpoint.tokens.count > (resume ?? processedTokenCount)
             {
-                rewind(to: position)
+                restore(checkpoint)
+                lastPrefixHitCount = checkpoint.tokens.count
+            } else {
+                if let resume { rewind(to: resume) }
+                lastPrefixHitCount = commonPrefix
             }
-            lastPrefixHitCount = commonPrefix
+        }
+        if let length = retainedPrefixLength,
+            pendingImageEmbeddings != nil || length >= input.count
+                || checkpoint.map({ $0.requestedLength == length && $0.matches(input) }) == true
+        {
+            retainedPrefixLength = nil
         }
 
         let token = GenerationToken()
@@ -564,6 +593,22 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             inferenceOptions: inferenceOptions,
             generationToken: token
         )
+    }
+
+    // MARK: - Prefix checkpoint
+
+    public func retainPrefix(length: Int) {
+        guard length > 0, states.slidingRing != nil else { return }
+        retainedPrefixLength = length
+    }
+
+    /// Resumes at the checkpoint. The flat caches already hold its positions: a request that resumes
+    /// from a checkpoint writes only past it.
+    private func restore(_ checkpoint: PrefixCheckpoint) {
+        states.restoreRing(checkpoint.ring)
+        processedTokenCount = checkpoint.tokens.count
+        history.clear()
+        history.append(contentsOf: checkpoint.tokens[...])
     }
 
     // MARK: - Inference
@@ -623,6 +668,17 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let batchEndToken = min(batchStartToken + batchSize - 1, totalTokenCount - 1)
             let tokensInBatch = batchEndToken - batchStartToken + 1
 
+            // This step crosses the retained length, so the state as it stands is the closest the
+            // prefill gets to it from below.
+            if let length = retainedPrefixLength, currentPosition <= length, batchEndToken >= length,
+                canRewind(to: currentPosition, alignment: maxQueryLength),
+                let ring = states.snapshotRing()
+            {
+                checkpoint = PrefixCheckpoint(
+                    tokens: Array(inputTokens[..<currentPosition]), ring: ring, requestedLength: length)
+                retainedPrefixLength = nil
+            }
+
             CLILogger.log("Graph: \(graphName), batch=\(batchSize), step=\(batchStartToken), tokens=\(tokensInBatch)")
 
             let prepareSpan = InstrumentsProfiler.beginPrepareStep(
@@ -671,6 +727,7 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             currentPosition = batchEndToken + 1
             processedTokenCount = currentPosition
         }
+        retainedPrefixLength = nil
         return logitBuffer
     }
 
@@ -1193,6 +1250,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     /// Moves the cursor back to `position`. The one path every restart and rewind goes
     /// through, so a restart always zeroes the states.
     private func rewind(to position: Int) {
+        // Writes from `position` on overwrite what the checkpoint's positions held.
+        if let checkpoint, position < checkpoint.tokens.count { self.checkpoint = nil }
         if position == 0 {
             processedTokenCount = 0
             history.clear()
