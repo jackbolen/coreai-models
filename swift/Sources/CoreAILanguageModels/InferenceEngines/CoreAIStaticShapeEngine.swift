@@ -102,23 +102,26 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     private var history = TokenHistory()
     public private(set) var lastPrefixHitCount: Int = 0
 
-    /// The sequence's leading tokens and the sliding ring as it stood after them. A ring cannot be
-    /// rewound far, so without a checkpoint a request that diverges from the history replays every
-    /// token.
-    private struct PrefixCheckpoint {
-        let tokens: [TokenId]
-        let ring: [String: NDArray]
-        /// The `retainPrefix(length:)` this checkpoint was taken for.
-        let requestedLength: Int
+    /// Prompt prefixes kept across requests. A ring cannot be rewound far, so without the cache a
+    /// request that diverges from the history replays every token. Nil unless the asset has a
+    /// sliding-window ring and bucketed flat caches.
+    private let prefixCache: PrefixCache?
+    /// The lengths the next request asked to resume from (`cachePrefixes(endingAt:)`).
+    private var declaredPrefixLengths: [Int] = []
 
-        func matches(_ input: [TokenId]) -> Bool {
-            input.count >= tokens.count && input.starts(with: tokens)
-        }
+    /// What the prefill of one request adds to `prefixCache`.
+    private struct PrefixPlan {
+        /// Token counts at which to snapshot the ring, ascending.
+        var snapshotPositions: [Int]
+        /// The snapshot at this position is never evicted.
+        let pinnedPosition: Int?
+        /// The prompt's blocks in the cache, root first, extended as the prefill completes more.
+        var blocks: [PrefixCache.Block]
+        /// Tokens past this are not recorded as blocks.
+        let recordLimit: Int
     }
 
-    private var checkpoint: PrefixCheckpoint?
-    /// Where the next prefill takes a checkpoint, set by `retainPrefix(length:)`.
-    private var retainedPrefixLength: Int?
+    private var prefixPlan: PrefixPlan?
 
     // Track in-flight generation via token
     private let tokenBox = GenerationTokenBox()
@@ -157,7 +160,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         preparedModel: PreparedModel,
         tensorData: [String: URL] = [:],
         visionModel: AIModel? = nil,
-        visionConfig: VisionConfig? = nil
+        visionConfig: VisionConfig? = nil,
+        prefixCacheBudgetBytes: Int = EngineOptions.defaultPrefixCacheBudgetBytes
     ) async throws {
         self.config = configuration
         self.samplingPolicy = SamplingPolicy(
@@ -224,10 +228,15 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         self.embeddingTable = try await Self.loadEmbeddingTable(from: model)
 
         // States: classified fixed vs per-bucket from the asset itself.
-        self.states = try StaticStateFactory.makeStateSet(
+        let states = try StaticStateFactory.makeStateSet(
             descriptorsByContext: descriptorsByContext,
             referenceDescriptor: referenceDescriptor,
             slidingWindow: configuration.overrides?.slidingWindow)
+        self.states = states
+        // Blocks end on step boundaries of the widest rung.
+        self.prefixCache =
+            states.slidingRing != nil && states.bucketed != nil
+            ? PrefixCache(blockSize: maxQueryLength, budgetBytes: prefixCacheBudgetBytes) : nil
 
         // Inputs: the standard filler, plus whichever optional handlers the graph asks for.
         var handlers: [any StaticInputHandler] = []
@@ -370,7 +379,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         modelURL: URL,
         tensorData: [String: URL] = [:],
         visionModelURL: URL,
-        visionConfig: VisionConfig
+        visionConfig: VisionConfig,
+        prefixCacheBudgetBytes: Int = EngineOptions.defaultPrefixCacheBudgetBytes
     ) async throws {
         let preparedModel = try await PreparedModel.prepare(at: modelURL)
         let preparedVision = try await PreparedModel.prepare(at: visionModelURL)
@@ -379,7 +389,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             preparedModel: preparedModel,
             tensorData: tensorData,
             visionModel: preparedVision.model,
-            visionConfig: visionConfig)
+            visionConfig: visionConfig,
+            prefixCacheBudgetBytes: prefixCacheBudgetBytes)
     }
 
     // MARK: - Initialization Helpers
@@ -554,34 +565,44 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         tokenBox.cancelActive()
 
         // Implicit prefix caching: resolve input against history.
+        var commonPrefix = 0
+        var resume: Int?
         if history.count > 0 {
             let (matchedPrefix, _) = history.resolve(input: input)
             // Every image position carries the same placeholder id, so a token-id match says
             // nothing about image content: a pending image invalidates the cached prefix from
             // its first position on.
-            let commonPrefix = Self.reusablePrefixLength(
+            commonPrefix = Self.reusablePrefixLength(
                 matchedPrefix: matchedPrefix,
                 firstImagePosition: pendingImageEmbeddings == nil ? nil : imageTokenPositions.min())
-            let resume = Self.resumePosition(
+            resume = Self.resumePosition(
                 commonPrefix: commonPrefix, inputCount: input.count, historyCount: history.count,
                 processed: processedTokenCount,
                 // The restart may run in any graph, the prefill graphs included.
                 canRewind: { canRewind(to: $0, alignment: maxQueryLength) })
-            if let checkpoint, pendingImageEmbeddings == nil, checkpoint.matches(input),
-                checkpoint.tokens.count > (resume ?? processedTokenCount)
-            {
-                restore(checkpoint)
-                lastPrefixHitCount = checkpoint.tokens.count
-            } else {
-                if let resume { rewind(to: resume) }
-                lastPrefixHitCount = commonPrefix
-            }
         }
-        if let length = retainedPrefixLength,
-            pendingImageEmbeddings != nil || length >= input.count
-                || checkpoint.map({ $0.requestedLength == length && $0.matches(input) }) == true
-        {
-            retainedPrefixLength = nil
+
+        // A prefix computed earlier, by any request, may resume further than the history does.
+        let declared = declaredPrefixLengths
+        declaredPrefixLengths = []
+        let match = pendingImageEmbeddings == nil ? prefixCache?.lookup(input) : nil
+        if let match, match.resumeTokens > (resume ?? processedTokenCount) {
+            try restore(match, input: input, validPositions: Swift.min(commonPrefix, processedTokenCount))
+            lastPrefixHitCount = match.resumeTokens
+        } else if history.count > 0 {
+            if let resume { rewind(to: resume) }
+            lastPrefixHitCount = commonPrefix
+        }
+        prefixPlan = nil
+        if let prefixCache, pendingImageEmbeddings == nil {
+            let blockSize = prefixCache.blockSize
+            prefixPlan = PrefixPlan(
+                snapshotPositions: Self.snapshotPositions(
+                    declared: declared, blockSize: blockSize, resume: processedTokenCount,
+                    inputCount: input.count, junction: match?.junctionTokens),
+                pinnedPosition: declared.min().map { $0 / blockSize * blockSize },
+                blocks: match?.blocks ?? [],
+                recordLimit: Self.recordLimit(declared: declared, blockSize: blockSize, inputCount: input.count))
         }
 
         let token = GenerationToken()
@@ -595,20 +616,83 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
         )
     }
 
-    // MARK: - Prefix checkpoint
+    // MARK: - Prefix cache
 
-    public func retainPrefix(length: Int) {
-        guard length > 0, states.slidingRing != nil else { return }
-        retainedPrefixLength = length
+    public func cachePrefixes(endingAt lengths: [Int]) {
+        declaredPrefixLengths = lengths.filter { $0 > 0 }
     }
 
-    /// Resumes at the checkpoint. The flat caches already hold its positions: a request that resumes
-    /// from a checkpoint writes only past it.
-    private func restore(_ checkpoint: PrefixCheckpoint) {
-        states.restoreRing(checkpoint.ring)
-        processedTokenCount = checkpoint.tokens.count
+    /// The token counts at which a prefill that resumes at `resume` snapshots the ring: each declared
+    /// length cut down to a block boundary, which is where a step ends, and the junction. Only
+    /// positions the prefill still passes through.
+    static func snapshotPositions(
+        declared: [Int], blockSize: Int, resume: Int, inputCount: Int, junction: Int?
+    ) -> [Int] {
+        let positions = declared.map { $0 / blockSize * blockSize } + (junction.map { [$0] } ?? [])
+        return Set(positions.filter { $0 > resume && $0 < inputCount }).sorted()
+    }
+
+    /// The tokens a prefill records as blocks: up to the last declared length, so that what follows
+    /// it (the part of a prompt that no later request shares) is left out, or the whole prompt when
+    /// none was declared.
+    static func recordLimit(declared: [Int], blockSize: Int, inputCount: Int) -> Int {
+        Swift.min(declared.max() ?? inputCount, inputCount) / blockSize * blockSize
+    }
+
+    /// Resumes at the snapshot `match` ends in. The flat caches already hold the positions of the
+    /// history that `input` shares (`validPositions`); the blocks past them come from the cache.
+    private func restore(_ match: PrefixCache.Match, input: [TokenId], validPositions: Int) throws {
+        guard let snapshot = match.resume?.snapshot, let bucketed = states.bucketed else {
+            throw InferenceRuntimeError.invalidState("The prefix cache matched a state the engine does not hold")
+        }
+        let resume = match.resumeTokens
+        if bucketed.currentContextBucket < resume {
+            // The next step writes at `resume`, in the bucket that the graph selection picks.
+            guard let bucket = decodeRungs.map(\.contextLength).filter({ $0 > resume }).min() else {
+                throw InferenceRuntimeError.invalidState("No graph with cache_len > \(resume)")
+            }
+            try states.prepare(contextBucket: bucket, writtenTokenCount: validPositions)
+        }
+        let blockSize = match.blockSize
+        for index in Swift.min(validPositions / blockSize, match.resumeBlockCount)..<match.resumeBlockCount {
+            states.insertFlat(match.blocks[index].kv, at: index * blockSize)
+        }
+        states.restoreRing(snapshot.ring)
+        processedTokenCount = resume
         history.clear()
-        history.append(contentsOf: checkpoint.tokens[...])
+        history.append(contentsOf: input[..<resume])
+    }
+
+    /// Snapshots the ring if `position` is one the plan asked for. All blocks below it are in the
+    /// cache by then.
+    private func snapshotPlannedPrefix(at position: Int) {
+        guard let prefixCache, var plan = prefixPlan else { return }
+        plan.snapshotPositions.removeAll { $0 < position }
+        if plan.snapshotPositions.first == position {
+            plan.snapshotPositions.removeFirst()
+            let index = position / prefixCache.blockSize - 1
+            if plan.blocks.indices.contains(index), let ring = states.snapshotRing() {
+                prefixCache.attachSnapshot(
+                    at: plan.blocks[index], ring: ring, pinned: position == plan.pinnedPosition)
+            }
+        }
+        prefixPlan = plan
+    }
+
+    /// Adds the blocks that the first `processed` tokens of `inputTokens` complete, up to the plan's
+    /// record limit, copying their positions out of the flat caches.
+    private func recordCompletedBlocks(of inputTokens: [Int32], processed: Int) {
+        guard let prefixCache, var plan = prefixPlan else { return }
+        let blockSize = prefixCache.blockSize
+        while (plan.blocks.count + 1) * blockSize <= Swift.min(processed, plan.recordLimit) {
+            let start = plan.blocks.count * blockSize
+            guard let kv = states.extractFlat(range: start..<start + blockSize),
+                let block = prefixCache.record(
+                    block: inputTokens[start..<start + blockSize], under: plan.blocks.last, kv: kv)
+            else { break }
+            plan.blocks.append(block)
+        }
+        prefixPlan = plan
     }
 
     // MARK: - Inference
@@ -651,8 +735,16 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
         var logitBuffer = [LogitsScalarType](repeating: 0, count: config.vocabSize)
         var currentPosition = processedTokenCount
+        // Only the request's own prefill feeds the prefix cache, not the decode steps after it.
+        defer {
+            if prefixPlan != nil {
+                prefixPlan = nil
+                prefixCache?.evict()
+            }
+        }
 
         while currentPosition < totalTokenCount {
+            snapshotPlannedPrefix(at: currentPosition)
             let remaining = totalTokenCount - currentPosition
             let usePrefill = remaining > maxQueryLength
             let graphName = try forwardGraph(
@@ -667,17 +759,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
             let batchStartToken = (currentPosition / batchSize) * batchSize
             let batchEndToken = min(batchStartToken + batchSize - 1, totalTokenCount - 1)
             let tokensInBatch = batchEndToken - batchStartToken + 1
-
-            // This step crosses the retained length, so the state as it stands is the closest the
-            // prefill gets to it from below.
-            if let length = retainedPrefixLength, currentPosition <= length, batchEndToken >= length,
-                canRewind(to: currentPosition, alignment: maxQueryLength),
-                let ring = states.snapshotRing()
-            {
-                checkpoint = PrefixCheckpoint(
-                    tokens: Array(inputTokens[..<currentPosition]), ring: ring, requestedLength: length)
-                retainedPrefixLength = nil
-            }
 
             CLILogger.log("Graph: \(graphName), batch=\(batchSize), step=\(batchStartToken), tokens=\(tokensInBatch)")
 
@@ -726,8 +807,8 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
 
             currentPosition = batchEndToken + 1
             processedTokenCount = currentPosition
+            recordCompletedBlocks(of: inputTokens, processed: currentPosition)
         }
-        retainedPrefixLength = nil
         return logitBuffer
     }
 
@@ -1250,8 +1331,6 @@ public final class StaticShapeEngine: InferenceEngine, @unchecked Sendable {
     /// Moves the cursor back to `position`. The one path every restart and rewind goes
     /// through, so a restart always zeroes the states.
     private func rewind(to position: Int) {
-        // Writes from `position` on overwrite what the checkpoint's positions held.
-        if let checkpoint, position < checkpoint.tokens.count { self.checkpoint = nil }
         if position == 0 {
             processedTokenCount = 0
             history.clear()

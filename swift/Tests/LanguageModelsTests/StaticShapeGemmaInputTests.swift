@@ -75,6 +75,44 @@ struct PrefixResumeTests {
     }
 }
 
+// MARK: - Prefix cache plan
+
+@Suite("Static-shape prefix cache plan")
+struct PrefixCachePlanTests {
+    private func positions(
+        declared: [Int], resume: Int = 0, inputCount: Int = 10_000, junction: Int? = nil
+    ) -> [Int] {
+        StaticShapeEngine.snapshotPositions(
+            declared: declared, blockSize: 64, resume: resume, inputCount: inputCount, junction: junction)
+    }
+
+    @Test("A declared length is cut down to a block boundary")
+    func roundsDown() {
+        #expect(positions(declared: [1000]) == [960])
+    }
+
+    @Test("A junction joins the declared lengths, ascending and without repeats")
+    func junctionJoins() {
+        #expect(positions(declared: [1000, 5000], junction: 3200) == [960, 3200, 4992])
+        #expect(positions(declared: [1000, 1010]) == [960])
+    }
+
+    @Test("Positions the prefill does not pass through are left out")
+    func passedPositionsDropped() {
+        // At or below the resume point, or at or past the end of the prompt.
+        #expect(positions(declared: [1000, 5000], resume: 960, inputCount: 4992) == [])
+        #expect(positions(declared: [1000, 5000], resume: 500, inputCount: 5001) == [960, 4992])
+        #expect(positions(declared: [30]) == [])
+    }
+
+    @Test("Blocks are recorded up to the last declared length, or the whole prompt without one")
+    func recordLimit() {
+        #expect(StaticShapeEngine.recordLimit(declared: [1000, 5000], blockSize: 64, inputCount: 9000) == 4992)
+        #expect(StaticShapeEngine.recordLimit(declared: [], blockSize: 64, inputCount: 9000) == 8960)
+        #expect(StaticShapeEngine.recordLimit(declared: [9500], blockSize: 64, inputCount: 9000) == 8960)
+    }
+}
+
 // MARK: - Sliding-window mask
 
 @Suite("Sliding-window ring mask")

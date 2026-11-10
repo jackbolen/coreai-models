@@ -122,7 +122,8 @@ public struct EngineFactory: Sendable {
             prefillChunkThreshold: options.prefillChunkThreshold,
             tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in
                 explicit
-            })
+            },
+            prefixCacheBudgetBytes: options.prefixCacheBudgetBytes)
 
         // Standard single-asset LLM: build the config and delegate to the asset/URL path.
         let engineConfig = ModelConfig(bundle: bundle)
@@ -179,7 +180,8 @@ public struct EngineFactory: Sendable {
             modelURL: languageModelURL,
             tensorData: bundle.tensorData.merging(options.tensorData) { _, explicit in explicit },
             visionModelURL: visionModelURL,
-            visionConfig: visionConfig
+            visionConfig: visionConfig,
+            prefixCacheBudgetBytes: options.prefixCacheBudgetBytes
         )
     }
 
@@ -393,7 +395,8 @@ public struct EngineFactory: Sendable {
             return try await StaticShapeEngine(
                 configuration: modelConfig,
                 preparedModel: preparedModel,
-                tensorData: options.tensorData
+                tensorData: options.tensorData,
+                prefixCacheBudgetBytes: options.prefixCacheBudgetBytes
             )
 
         case .sequential:
@@ -457,6 +460,14 @@ public struct EngineOptions: Sendable {
     /// ``TensorDataKey``). A role absent here is data the bundle does not ship.
     public let tensorData: [String: URL]
 
+    /// The memory, in bytes, a static-shape engine may keep for reusing prompt prefixes across
+    /// requests (see ``InferenceEngine/cachePrefixes(endingAt:)``). Engines without a
+    /// sliding-window ring ignore it.
+    public let prefixCacheBudgetBytes: Int
+
+    /// The default ``prefixCacheBudgetBytes``: 1 GiB.
+    public static let defaultPrefixCacheBudgetBytes = 1 << 30
+
     /// Well-known `assets` roles for tensor data.
     public enum TensorDataKey {
         /// INT8 per-layer embeddings table (`*_ple.safetensors`).
@@ -474,13 +485,16 @@ public struct EngineOptions: Sendable {
     ///   - prefillChunkSize: Tokens per prefill chunk, or `nil` to use model/engine default.
     ///   - prefillChunkThreshold: Minimum prompt tokens to trigger chunking, or `nil` for default.
     ///   - tensorData: Tensor data URLs keyed by `auxiliary_assets` role. Defaults to empty.
+    ///   - prefixCacheBudgetBytes: Memory for reusing prompt prefixes. Defaults to
+    ///     ``defaultPrefixCacheBudgetBytes``.
     public init(
         variant: String? = nil,
         kvCacheStrategy: KVCacheStrategy = .auto,
         kvCacheSize: Int? = nil,
         prefillChunkSize: Int? = nil,
         prefillChunkThreshold: Int? = nil,
-        tensorData: [String: URL] = [:]
+        tensorData: [String: URL] = [:],
+        prefixCacheBudgetBytes: Int = EngineOptions.defaultPrefixCacheBudgetBytes
     ) {
         self.variant = variant
         self.kvCacheStrategy = kvCacheStrategy
@@ -488,6 +502,7 @@ public struct EngineOptions: Sendable {
         self.prefillChunkSize = prefillChunkSize
         self.prefillChunkThreshold = prefillChunkThreshold
         self.tensorData = tensorData
+        self.prefixCacheBudgetBytes = prefixCacheBudgetBytes
     }
 
     /// Returns the KV cache size in tokens that the engine uses for a given context length.

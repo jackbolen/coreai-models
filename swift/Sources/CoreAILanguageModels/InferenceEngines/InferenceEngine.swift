@@ -228,13 +228,13 @@ public protocol InferenceEngine: Sendable {
     /// Useful for debugging multi-turn efficiency and verifying prefix caching behavior.
     var lastPrefixHitCount: Int { get }
 
-    /// Asks the engine to keep its state as it stands after the first `length` tokens of the next
-    /// `generate()` call, so that a later request beginning with the same tokens resumes there
-    /// instead of replaying them.
+    /// Asks the engine to keep its state as it stands after the first `lengths` tokens of the next
+    /// `generate()` call, so that any later request beginning with the same tokens resumes there
+    /// instead of replaying them, whichever request or branch of a conversation computed them.
     ///
-    /// Engines whose cache can already be rewound to any position, and engines that keep no history,
-    /// ignore the request.
-    func retainPrefix(length: Int)
+    /// An engine may keep the state at a nearby earlier position instead. Engines whose cache can
+    /// already be rewound to any position, and engines that keep no history, ignore the request.
+    func cachePrefixes(endingAt lengths: [Int])
 
     /// Whether the engine carries recurrent state (SSM / hybrid models).
     ///
@@ -305,7 +305,7 @@ extension InferenceEngine {
     public var lastPrefixHitCount: Int { 0 }
 
     /// Default: nothing to retain.
-    public func retainPrefix(length: Int) {}
+    public func cachePrefixes(endingAt lengths: [Int]) {}
 }
 
 extension InferenceEngine {

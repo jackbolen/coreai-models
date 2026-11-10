@@ -106,8 +106,8 @@ struct Gemma4OnDeviceTests {
         let system = try tokenizer.applyChatTemplate(messages: [["role": "system", "content": Self.rules]])
         let shared = zip(system.map(Int32.init), try prompt(14)).prefix { $0 == $1 }.count
 
-        func firstLogits(_ input: [Int32]) async throws -> [Float] {
-            engine.retainPrefix(length: shared)
+        func firstLogits(_ engine: any InferenceEngine, _ input: [Int32]) async throws -> [Float] {
+            engine.cachePrefixes(endingAt: [shared])
             let output = try await engine.generate(
                 with: input, samplingConfiguration: .greedy,
                 inferenceOptions: InferenceOptions(maxTokens: 1, logits: .lastPosition))
@@ -115,14 +115,91 @@ struct Gemma4OnDeviceTests {
             return []
         }
 
-        _ = try await firstLogits(prompt(14))
-        let resumed = try await firstLogits(prompt(15))
+        _ = try await firstLogits(engine, prompt(14))
+        let resumed = try await firstLogits(engine, prompt(15))
         #expect(engine.lastPrefixHitCount > 0)
-        try await engine.reset()
-        let cold = try await firstLogits(prompt(15))
+        // The reference keeps no prefix, so it replays every token.
+        let reference = try await EngineFactory.createEngine(
+            bundle: LanguageModelBundle(at: Self.bundleURL), options: EngineOptions(prefixCacheBudgetBytes: 0))
+        let cold = try await firstLogits(reference, prompt(15))
 
         #expect(cold.count > 1_000)
         #expect(zip(resumed, cold).map { abs($0 - $1) }.max() ?? .infinity < 0.05)
+    }
+
+    /// A stretch of transcript, long enough that replaying it costs far more than a question.
+    private static func transcript(_ name: String, lines: Int = 50) -> String {
+        (1...lines).map { "\(name) \($0): the tool call touched file \($0 * 7) and finished without error.\n" }
+            .joined()
+    }
+
+    @Test("Requests that branch from a shared transcript resume from it and match cold runs")
+    func branchesMatchCold() async throws {
+        let cached = try await CoreAIRunner(contentsOf: Self.bundleURL).makeInferenceEngine()
+        // The reference keeps no prefix: its budget leaves no block and no snapshot behind.
+        let cold = try await EngineFactory.createEngine(
+            bundle: LanguageModelBundle(at: Self.bundleURL), options: EngineOptions(prefixCacheBudgetBytes: 0))
+        let tokenizer = try await LanguageModelBundle(at: Self.bundleURL).loadTokenizer()
+
+        func prompt(_ transcript: String) throws -> [Int32] {
+            try tokenizer.applyChatTemplate(messages: [
+                ["role": "system", "content": String(Self.rules.prefix(6_000))],
+                ["role": "user", "content": transcript],
+            ]).map(Int32.init)
+        }
+        /// Tokens that two prompts continuing `transcript` differently share.
+        func end(of transcript: String) throws -> Int {
+            zip(try prompt(transcript + "Alpha"), try prompt(transcript + "Beta")).prefix { $0 == $1 }.count
+        }
+        func firstLogits(
+            _ engine: any InferenceEngine, _ input: [Int32], declaring lengths: [Int] = []
+        ) async throws -> (logits: [Float], seconds: Double) {
+            engine.cachePrefixes(endingAt: lengths)
+            let start = ContinuousClock.now
+            let output = try await engine.generate(
+                with: input, samplingConfiguration: .greedy,
+                inferenceOptions: InferenceOptions(maxTokens: 1, logits: .lastPosition))
+            for try await item in output {
+                return ((item.logits ?? []).map(Float.init), start.duration(to: .now) / .seconds(1))
+            }
+            return ([], 0)
+        }
+        func coldLogits(_ input: [Int32]) async throws -> (logits: [Float], seconds: Double) {
+            try await cold.reset()
+            return try await firstLogits(cold, input)
+        }
+
+        let (base, mainOne, mainTwo, fork, sibling) = (
+            Self.transcript("history"), Self.transcript("main one"), Self.transcript("main two"),
+            Self.transcript("fork"), Self.transcript("sibling")
+        )
+        let baseEnd = try end(of: base)
+        let mainOneEnd = try end(of: base + mainOne)
+        let mainTwoEnd = try end(of: base + mainOne + mainTwo)
+
+        // Warm both engines' graphs so that the timings below compare prefill alone.
+        _ = try await firstLogits(cached, prompt("warm up"))
+        _ = try await coldLogits(prompt("warm up"))
+
+        let requests: [(name: String, transcript: String, declared: [Int])] = [
+            ("main", base + "Alpha", [baseEnd]),
+            ("main continues", base + mainOne + "Alpha", [baseEnd, mainOneEnd]),
+            ("fork", base + fork + "Alpha", [baseEnd]),
+            ("main after the fork", base + mainOne + mainTwo + "Alpha", [baseEnd, mainOneEnd, mainTwoEnd]),
+            ("sibling of the fork", base + sibling + "Alpha", [baseEnd]),
+        ]
+        for request in requests {
+            let input = try prompt(request.transcript)
+            let resumed = try await firstLogits(cached, input, declaring: request.declared)
+            let reference = try await coldLogits(input)
+            print(
+                "\(request.name): resumed \(resumed.seconds) s, cold \(reference.seconds) s, "
+                    + "\(cached.lastPrefixHitCount) of \(input.count) tokens matched")
+            #expect(reference.logits.count > 1_000)
+            #expect(zip(resumed.logits, reference.logits).map { abs($0 - $1) }.max() ?? .infinity < 0.05)
+            // The first request has nothing to resume from; every other one skips most of its prompt.
+            if request.name != "main" { #expect(resumed.seconds * 1.5 < reference.seconds, "\(request.name)") }
+        }
     }
 }
 

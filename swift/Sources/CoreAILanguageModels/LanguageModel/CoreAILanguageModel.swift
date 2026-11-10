@@ -301,7 +301,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 // ordering — we no longer mint an entryID and pass it down.
 
                 // Every session over these instructions begins with the same tokens.
-                engine.retainPrefix(length: instructionTokenCount)
+                engine.cachePrefixes(endingAt: [instructionTokenCount])
 
                 // Check if guided generation is requested
                 if let schema = request.schema {
