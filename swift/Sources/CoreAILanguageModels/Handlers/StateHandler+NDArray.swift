@@ -333,15 +333,17 @@ public final class GrowingNDArrayState: SyncStateHandler, RegionCopyable {
 
 // MARK: - Shared Utilities
 
-/// Copies the leading `runElements` elements of each of `blockCount` blocks from
-/// `source` to `destination`, whose blocks start every `sourceBlockStride` and
-/// `destinationBlockStride` elements respectively.
+/// Copies `runElements` elements of each of `blockCount` blocks from `source` to `destination`,
+/// whose blocks start every `sourceBlockStride` and `destinationBlockStride` elements
+/// respectively. Each run starts `sourceOffset` and `destinationOffset` elements into its block,
+/// so the default offsets copy the leading elements.
 ///
 /// A raw byte copy, so it works for any byte-addressable scalar type (fp16/bf16/fp32
 /// and 8-bit KV caches alike); a typed view would trap on a mismatched type.
 func copyBlockPrefixes(
     from source: NDArray, to destination: inout NDArray,
-    blockCount: Int, sourceBlockStride: Int, destinationBlockStride: Int, runElements: Int
+    blockCount: Int, sourceBlockStride: Int, destinationBlockStride: Int, runElements: Int,
+    sourceOffset: Int = 0, destinationOffset: Int = 0
 ) {
     guard let width = stateElementByteWidth(source.scalarType) else {
         preconditionFailure("Packed sub-byte scalar type for state copy: \(source.scalarType)")
@@ -349,8 +351,8 @@ func copyBlockPrefixes(
     source.rawView().withUnsafeBytes { sourceBytes, _, _ in
         destination.mutableRawView().withUnsafeMutableBytes { destinationBytes, _, _ in
             for block in 0..<blockCount {
-                (destinationBytes + block * destinationBlockStride * width).copyMemory(
-                    from: sourceBytes + block * sourceBlockStride * width,
+                (destinationBytes + (block * destinationBlockStride + destinationOffset) * width).copyMemory(
+                    from: sourceBytes + (block * sourceBlockStride + sourceOffset) * width,
                     byteCount: runElements * width)
             }
         }

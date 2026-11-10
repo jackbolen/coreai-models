@@ -257,23 +257,59 @@ final class BucketedStaticState: StaticStateStorage {
     /// without knowing the interleave details. ``validateLayout`` enforces the
     /// preconditions this relies on.
     static func copyPrefix(from source: NDArray, to destination: inout NDArray, copyLength: Int) {
-        let sourceShape = source.shape
-        let destinationShape = destination.shape
-        let sequenceDimension = sourceShape.count - 1
-        let sourceSequence = sourceShape[sequenceDimension]
-        let destinationSequence = destinationShape[sequenceDimension]
-        let factor = source.interleaveLayout?.factor ?? 1
+        let sourceRuns = runGeometry(of: source)
+        let destinationRuns = runGeometry(of: destination)
         precondition(
-            copyLength <= sourceSequence && copyLength <= destinationSequence,
-            "copyPrefix overflow: \(copyLength) into \(sourceSequence) → \(destinationSequence)")
-
-        let groupCount = sourceShape.reduce(1, *) / sourceSequence / factor
-        let sourceGroupStride = sourceSequence * factor
-        let destinationGroupStride = destinationSequence * factor
+            copyLength <= sourceRuns.sequence && copyLength <= destinationRuns.sequence,
+            "copyPrefix overflow: \(copyLength) into \(sourceRuns.sequence) → \(destinationRuns.sequence)")
         copyBlockPrefixes(
-            from: source, to: &destination, blockCount: groupCount,
-            sourceBlockStride: sourceGroupStride, destinationBlockStride: destinationGroupStride,
-            runElements: copyLength * factor)
+            from: source, to: &destination, blockCount: sourceRuns.groups,
+            sourceBlockStride: sourceRuns.groupStride, destinationBlockStride: destinationRuns.groupStride,
+            runElements: copyLength * sourceRuns.factor)
+    }
+
+    /// How a `[…, ctx]` state lays out its sequence positions, as in ``copyPrefix(from:to:copyLength:)``:
+    /// `groups` runs of `groupStride` elements, in each of which position `p` takes the `factor`
+    /// elements from `p · factor`.
+    private static func runGeometry(of array: NDArray) -> (
+        sequence: Int, factor: Int, groups: Int, groupStride: Int
+    ) {
+        let shape = array.shape
+        let sequence = shape[shape.count - 1]
+        let factor = array.interleaveLayout?.factor ?? 1
+        return (sequence, factor, shape.reduce(1, *) / sequence / factor, sequence * factor)
+    }
+
+    // MARK: Position ranges
+
+    /// The positions `range` of `state`, compact: one run of `range.count · factor` elements per
+    /// group, so the result does not depend on the sequence stride of the bucket it came from.
+    static func extractPositions(_ range: Range<Int>, from state: NDArray) -> NDArray {
+        let runs = runGeometry(of: state)
+        precondition(range.lowerBound >= 0 && range.upperBound <= runs.sequence, "positions \(range) outside \(runs.sequence)")
+        var compact = NDArray(shape: [runs.groups, range.count * runs.factor], scalarType: state.scalarType)
+        copyBlockPrefixes(
+            from: state, to: &compact, blockCount: runs.groups,
+            sourceBlockStride: runs.groupStride, destinationBlockStride: range.count * runs.factor,
+            runElements: range.count * runs.factor, sourceOffset: range.lowerBound * runs.factor)
+        return compact
+    }
+
+    /// Writes positions taken by ``extractPositions(_:from:)`` into `state` from `position` on.
+    static func insertPositions(_ compact: NDArray, at position: Int, into state: inout NDArray) {
+        let runs = runGeometry(of: state)
+        let runElements = compact.shape[1]
+        precondition(
+            compact.shape.count == 2 && compact.shape[0] == runs.groups && compact.scalarType == state.scalarType
+                && runElements % runs.factor == 0,
+            "positions were taken from a state of another layout")
+        precondition(
+            position >= 0 && position + runElements / runs.factor <= runs.sequence,
+            "positions at \(position) outside \(runs.sequence)")
+        copyBlockPrefixes(
+            from: compact, to: &state, blockCount: runs.groups,
+            sourceBlockStride: runElements, destinationBlockStride: runs.groupStride,
+            runElements: runElements, destinationOffset: position * runs.factor)
     }
 }
 
@@ -356,6 +392,26 @@ struct StaticStateSet {
     /// Puts back a ring taken by ``snapshotRing()``.
     func restoreRing(_ snapshot: [String: NDArray]) {
         for (name, array) in snapshot { fixed?.arrays[name] = array }
+    }
+
+    /// The flat caches' positions `range`, compact and independent of the running context bucket's
+    /// sequence stride, or nil when the asset has no bucketed states. `range` must lie within the
+    /// bucket the storage is laid out for.
+    func extractFlat(range: Range<Int>) -> [String: NDArray]? {
+        guard let bucketed else { return nil }
+        return Dictionary(
+            uniqueKeysWithValues: bucketed.stateNames.map {
+                ($0, BucketedStaticState.extractPositions(range, from: bucketed.arrays[$0]!))
+            })
+    }
+
+    /// Writes positions taken by ``extractFlat(range:)`` into the flat caches from `position` on.
+    /// The storage must be laid out for a bucket that holds them.
+    func insertFlat(_ positions: [String: NDArray], at position: Int) {
+        guard let bucketed else { return }
+        for name in bucketed.stateNames {
+            BucketedStaticState.insertPositions(positions[name]!, at: position, into: &bucketed.arrays[name]!)
+        }
     }
 
     /// A state's backing array, from whichever handler owns it; nil when none does. Lets a draft

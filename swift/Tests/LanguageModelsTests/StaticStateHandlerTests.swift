@@ -146,6 +146,157 @@ struct BucketedStaticStatePrefixTests {
     }
 }
 
+// MARK: - Position ranges
+
+@Suite("BucketedStaticState position ranges")
+struct BucketedStaticStatePositionTests {
+    /// A `[layers, 1, channels, 1, ctx]` cache whose element at (group, position) is
+    /// `group * 1000 + position`.
+    private func makeCache(layers: Int = 3, channels: Int = 4, context: Int) -> NDArray {
+        var array = NDArray(shape: [layers, 1, channels, 1, context], scalarType: .float16)
+        fillNDArray(&array, as: Float16.self, count: layers * channels * context) { index in
+            Float16(index / context * 1000 + index % context)
+        }
+        return array
+    }
+
+    private func zeroCache(layers: Int = 3, channels: Int = 4, context: Int) -> NDArray {
+        var array = NDArray(shape: [layers, 1, channels, 1, context], scalarType: .float16)
+        zeroFillNDArray(&array)
+        return array
+    }
+
+    @Test("Extracted positions are one compact run per group")
+    func extractIsCompact() {
+        let compact = BucketedStaticState.extractPositions(2..<6, from: makeCache(context: 8))
+
+        #expect(compact.shape == [12, 4])
+        let values = readNDArray(compact, as: Float16.self, count: 12 * 4)
+        for group in 0..<12 {
+            for offset in 0..<4 {
+                #expect(values[group * 4 + offset] == Float16(group * 1000 + 2 + offset))
+            }
+        }
+    }
+
+    @Test("Inserted positions land at the destination's own stride and nowhere else")
+    func insertLandsAtPosition() {
+        let compact = BucketedStaticState.extractPositions(2..<6, from: makeCache(context: 8))
+        var destination = zeroCache(context: 32)
+
+        BucketedStaticState.insertPositions(compact, at: 10, into: &destination)
+
+        let values = readNDArray(destination, as: Float16.self, count: 12 * 32)
+        for group in 0..<12 {
+            for position in 0..<32 {
+                let expected: Float16 = (10..<14).contains(position) ? Float16(group * 1000 + position - 8) : 0
+                #expect(values[group * 32 + position] == expected, "group \(group) position \(position)")
+            }
+        }
+    }
+
+    @Test("Positions survive a re-layout to another bucket and an insert into a third")
+    func roundTripAcrossBuckets() {
+        let small = makeCache(context: 8)
+        var large = zeroCache(context: 32)
+        BucketedStaticState.copyPrefix(from: small, to: &large, copyLength: 8)
+
+        let fromSmall = BucketedStaticState.extractPositions(1..<7, from: small)
+        let fromLarge = BucketedStaticState.extractPositions(1..<7, from: large)
+        #expect(readNDArray(fromSmall, as: Float16.self, count: 72) == readNDArray(fromLarge, as: Float16.self, count: 72))
+
+        var other = zeroCache(context: 16)
+        BucketedStaticState.insertPositions(fromLarge, at: 1, into: &other)
+        let values = readNDArray(other, as: Float16.self, count: 12 * 16)
+        for group in 0..<12 {
+            for position in 1..<7 {
+                #expect(values[group * 16 + position] == Float16(group * 1000 + position))
+            }
+        }
+    }
+
+    /// `[2, 1, 8, 1, ctx]` with the channels interleaved by 4: each of the four groups is one run of
+    /// `ctx · 4` elements holding each position's four channels together. The element at
+    /// (group, position, lane) holds the bit pattern `group * 1000 + position * 4 + lane`.
+    private func makeInterleavedCache(context: Int, filled: Bool = true) -> NDArray {
+        var array = NDArray(
+            shape: [2, 1, 8, 1, context], scalarType: .float16,
+            strides: [8 * context, 8 * context, 4 * context, 4 * context, 4],
+            interleaveLayout: NDArray.InterleaveLayout(dimension: 2, factor: 4))
+        array.mutableRawView().withUnsafeMutableBytes { raw, _, _ in
+            let bits = raw.assumingMemoryBound(to: UInt16.self)
+            for index in 0..<(4 * context * 4) {
+                bits[index] = filled ? UInt16(index / (context * 4) * 1000 + index % (context * 4)) : 0
+            }
+        }
+        return array
+    }
+
+    private func bits(_ array: NDArray, count: Int) -> [UInt16] {
+        var values: [UInt16] = []
+        array.rawView().withUnsafeBytes { raw, _, _ in
+            let bits = raw.assumingMemoryBound(to: UInt16.self)
+            values = (0..<count).map { bits[$0] }
+        }
+        return values
+    }
+
+    @Test("An interleaved state keeps each position's lanes together")
+    func interleavedPositions() {
+        let compact = BucketedStaticState.extractPositions(1..<3, from: makeInterleavedCache(context: 8))
+        #expect(compact.shape == [4, 8])
+        let run = bits(compact, count: 4 * 8)
+        for group in 0..<4 {
+            for element in 0..<8 {
+                #expect(run[group * 8 + element] == UInt16(group * 1000 + 4 + element))
+            }
+        }
+
+        var destination = makeInterleavedCache(context: 16, filled: false)
+        BucketedStaticState.insertPositions(compact, at: 5, into: &destination)
+        let values = bits(destination, count: 4 * 16 * 4)
+        for group in 0..<4 {
+            for element in 0..<(16 * 4) {
+                let expected = (20..<28).contains(element) ? UInt16(group * 1000 + element - 16) : 0
+                #expect(values[group * 64 + element] == expected, "group \(group) element \(element)")
+            }
+        }
+    }
+
+    @Test("An 8-bit state is copied as raw bytes")
+    func eightBitState() {
+        var source = NDArray(shape: [2, 1, 2, 1, 8], scalarType: .int8)
+        source.mutableRawView().withUnsafeMutableBytes { raw, _, _ in
+            let bytes = raw.assumingMemoryBound(to: Int8.self)
+            for index in 0..<(4 * 8) { bytes[index] = Int8(index / 8 * 20 + index % 8) }
+        }
+        var destination = NDArray(shape: [2, 1, 2, 1, 16], scalarType: .int8)
+        zeroFillNDArray(&destination)
+
+        let compact = BucketedStaticState.extractPositions(3..<7, from: source)
+        BucketedStaticState.insertPositions(compact, at: 9, into: &destination)
+
+        var values: [Int8] = []
+        destination.rawView().withUnsafeBytes { raw, _, _ in
+            let bytes = raw.assumingMemoryBound(to: Int8.self)
+            values = (0..<(4 * 16)).map { bytes[$0] }
+        }
+        for group in 0..<4 {
+            for position in 0..<16 {
+                let expected = (9..<13).contains(position) ? Int8(group * 20 + position - 6) : 0
+                #expect(values[group * 16 + position] == expected)
+            }
+        }
+    }
+
+    @Test("An asset without bucketed states has no flat positions to take")
+    func noBucketedStates() {
+        let states = StaticStateSet(bucketed: nil, fixed: nil, slidingRing: nil)
+        #expect(states.extractFlat(range: 0..<4) == nil)
+        states.insertFlat([:], at: 0)
+    }
+}
+
 // MARK: - Reset
 
 @Suite("StaticStateStorage reset")
