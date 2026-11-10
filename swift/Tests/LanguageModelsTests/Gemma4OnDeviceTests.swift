@@ -201,6 +201,36 @@ struct Gemma4OnDeviceTests {
             if request.name != "main" { #expect(resumed.seconds * 1.5 < reference.seconds, "\(request.name)") }
         }
     }
+
+    @Test("A request resumes from the first segment of its prompt when only the last one changes")
+    func segmentedPromptResumes() async throws {
+        let model = try await CoreAILanguageModel(resourcesAt: Self.bundleURL)
+        // Short instructions hold no block, so only the end of the first segment can be resumed from.
+        func ask(_ item: Int) async throws -> (Verdict, seconds: Double) {
+            let session = LanguageModelSession(model: model, instructions: "Answer the question about the log.")
+            let start = ContinuousClock.now
+            let response = try await session.respond(
+                to: Prompt {
+                    Self.transcript("history", lines: 200)
+                    "Is item \(item) risky?"
+                },
+                generating: Verdict.self,
+                options: GenerationOptions(samplingMode: .greedy),
+                contextOptions: ContextOptions(includeSchemaInPrompt: false))
+            return (response.content, start.duration(to: .now) / .seconds(1))
+        }
+
+        let first = try await ask(14)
+        let resumed = try await ask(15)
+        model.unload()
+        let cold = try await ask(15)
+        print(
+            "\(Self.bundleURL.lastPathComponent): first \(first.seconds) s, resumed \(resumed.seconds) s, "
+                + "cold \(cold.seconds) s")
+
+        #expect(resumed.0 == cold.0)
+        #expect(resumed.seconds * 1.5 < cold.seconds)
+    }
 }
 
 #endif

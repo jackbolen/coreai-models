@@ -269,14 +269,12 @@ public struct CoreAILanguageModel: LanguageModel {
                 reasoningEffort: reasoningEffort,
                 component: "CoreAIExecutor"
             )
-            let instructionTokenCount = Self.instructionTokenCount(
-                of: promptTokens,
-                transcript: Array(request.transcript),
-                using: model.tokenizer,
-                tools: request.enabledToolDefinitions,
-                toolCallDetection: model.toolCallDetection,
-                reasoningEffort: reasoningEffort
-            )
+            let boundaries = Self.prefixBoundaries(of: promptTokens, transcript: Array(request.transcript)) {
+                Self.makeTokens(
+                    from: $0, using: model.tokenizer, tools: request.enabledToolDefinitions,
+                    toolCallDetection: model.toolCallDetection, reasoningEffort: reasoningEffort,
+                    component: "CoreAIExecutor")
+            }
             guard !promptTokens.isEmpty else {
                 tokenizationSpan.end()
                 throw LanguageModelError.unsupportedTranscriptContent(
@@ -300,9 +298,6 @@ public struct CoreAILanguageModel: LanguageModel {
                 // FoundationModels now threads entry identity itself based on event
                 // ordering — we no longer mint an entryID and pass it down.
 
-                // Every session over these instructions begins with the same tokens.
-                engine.cachePrefixes(endingAt: [instructionTokenCount])
-
                 // Check if guided generation is requested
                 if let schema = request.schema {
                     guard engine.supportsGuidedGeneration else {
@@ -320,6 +315,7 @@ public struct CoreAILanguageModel: LanguageModel {
                         model: model,
                         schema: schema,
                         promptTokens: promptTokens,
+                        boundaries: boundaries,
                         thinks: model.supportsReasoning
                             && Self.reasoningTemplateContext(reasoningEffort)["enable_thinking"] as? Bool == true,
                         samplingConfig: effectiveSamplingConfig,
@@ -331,6 +327,7 @@ public struct CoreAILanguageModel: LanguageModel {
                         engine: engine,
                         model: model,
                         promptTokens: promptTokens,
+                        boundaries: boundaries,
                         samplingConfig: effectiveSamplingConfig,
                         maxTokens: maxTokens,
                         channel: channel
@@ -339,26 +336,32 @@ public struct CoreAILanguageModel: LanguageModel {
             }
         }
 
-        /// How many leading tokens of `promptTokens` the instructions alone determine: those it shares
-        /// with the same transcript cut down to its instructions. Zero without instructions.
-        static func instructionTokenCount(
+        /// The token counts, ascending, at which a later request may share the start of `promptTokens`:
+        /// after the instructions, and after each segment of the last prompt but its final one.
+        ///
+        /// A boundary is what `promptTokens` shares with `render` of the transcript cut there, so a cut
+        /// that tokenizes differently shortens its boundary rather than misplacing it.
+        static func prefixBoundaries(
             of promptTokens: [Int],
             transcript: [Transcript.Entry],
-            using tokenizer: any Tokenizer,
-            tools: [Transcript.ToolDefinition],
-            toolCallDetection: ToolCallDetection?,
-            reasoningEffort: String?
-        ) -> Int {
+            render: ([Transcript.Entry]) -> [Int]
+        ) -> [Int] {
+            var cuts: [[Transcript.Entry]] = []
             let instructions = transcript.filter {
                 if case .instructions = $0 { return true }
                 return false
             }
-            guard !instructions.isEmpty else { return 0 }
-            let leading = makeTokens(
-                from: instructions, using: tokenizer, tools: tools,
-                toolCallDetection: toolCallDetection, reasoningEffort: reasoningEffort,
-                component: "CoreAIExecutor")
-            return zip(leading, promptTokens).prefix { $0 == $1 }.count
+            if !instructions.isEmpty { cuts.append(instructions) }
+            if let index = transcript.lastIndex(where: { if case .prompt = $0 { true } else { false } }),
+                case .prompt(let prompt) = transcript[index]
+            {
+                for count in 1..<Swift.max(1, prompt.segments.count) {
+                    let segments = Array(prompt.segments.prefix(count))
+                    cuts.append(Array(transcript[..<index]) + [.prompt(Transcript.Prompt(segments: segments))])
+                }
+            }
+            let shared = cuts.map { zip(render($0), promptTokens).prefix { $0 == $1 }.count }
+            return Set(shared.filter { $0 > 0 }).sorted()
         }
 
         // MARK: - Vanilla Generation (no schema)
@@ -367,11 +370,13 @@ public struct CoreAILanguageModel: LanguageModel {
             engine: any InferenceEngine,
             model: CoreAILanguageModel,
             promptTokens: [Int],
+            boundaries: [Int],
             samplingConfig: SamplingConfiguration,
             maxTokens: Int,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
             let tokenizer = model.tokenizer
+            engine.cachePrefixes(endingAt: boundaries)
             let tokenStream = try await engine.generate(
                 with: promptTokens.map(Int32.init),
                 samplingConfiguration: samplingConfig,
@@ -561,6 +566,7 @@ public struct CoreAILanguageModel: LanguageModel {
             model: CoreAILanguageModel,
             schema: GenerationSchema,
             promptTokens: [Int],
+            boundaries: [Int],
             thinks: Bool,
             samplingConfig: SamplingConfiguration,
             maxTokens: Int,
@@ -570,7 +576,7 @@ public struct CoreAILanguageModel: LanguageModel {
             let thought =
                 thinks
                 ? try await think(
-                    engine: engine, model: model, promptTokens: promptTokens,
+                    engine: engine, model: model, promptTokens: promptTokens, boundaries: boundaries,
                     samplingConfig: samplingConfig, channel: channel)
                 : []
             let schemaData = try JSONEncoder().encode(schema)
@@ -594,6 +600,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 additionalEosTokenIds: model.additionalEosTokenIds
             )
 
+            engine.cachePrefixes(endingAt: boundaries)
             let stream = try await strategy.decode(
                 from: .tokens(promptTokens + thought),
                 tokenizer: model.tokenizer,
@@ -638,6 +645,7 @@ public struct CoreAILanguageModel: LanguageModel {
             engine: any InferenceEngine,
             model: CoreAILanguageModel,
             promptTokens: [Int],
+            boundaries: [Int],
             samplingConfig: SamplingConfiguration,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws -> [Int] {
@@ -648,6 +656,7 @@ public struct CoreAILanguageModel: LanguageModel {
                 closeTokens.count == 1, let closeToken = closeTokens.first
             else { return [] }
 
+            engine.cachePrefixes(endingAt: boundaries)
             let tokenStream = try await engine.generate(
                 with: promptTokens.map(Int32.init),
                 samplingConfiguration: samplingConfig,
