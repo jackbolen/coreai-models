@@ -408,6 +408,24 @@ public func detectThinkingFormat(using tokenizer: any Tokenizer) -> ThinkTagPars
     return .tagPair(open: "<think>", close: "</think>")
 }
 
+/// The thinking markers a bundle's own tokenizer config declares, or nil when it declares none.
+///
+/// Reads `response_template.fields.thinking.open`/`close` from `tokenizer_config.json`, which is
+/// where a Gemma 4 export spells out `<|channel>thought\n` and `<channel|>`; neither marker is a
+/// single vocabulary entry that `detectThinkingFormat` could probe for.
+public func declaredThinkingFormat(inTokenizerDirectory directory: URL) -> ThinkTagParser.Format? {
+    let configURL = directory.appending(path: "tokenizer_config.json")
+    guard let data = try? Data(contentsOf: configURL),
+        let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+        let template = json["response_template"] as? [String: Any],
+        let fields = template["fields"] as? [String: Any],
+        let thinking = fields["thinking"] as? [String: Any],
+        let open = thinking["open"] as? String, !open.isEmpty,
+        let close = thinking["close"] as? String, !close.isEmpty
+    else { return nil }
+    return .tagPair(open: open, close: close)
+}
+
 /// Turn-end token ID for an agentic thinking format, or nil.
 ///
 /// Agentic models stop on `<|eot|>` so a runner doesn't loop self->user turns.

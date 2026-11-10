@@ -155,7 +155,8 @@ public struct CoreAILanguageModel: LanguageModel {
         maxWhitespaceCount: Int?
     ) {
         let toolCallDetection = detectToolCallFormat(using: tokenizer)
-        let thinkingFormat = detectThinkingFormat(using: tokenizer)
+        let declaredThinking = bundle.tokenizerPath.flatMap(declaredThinkingFormat(inTokenizerDirectory:))
+        let thinkingFormat = declaredThinking ?? detectThinkingFormat(using: tokenizer)
         self.url = configuration.url
         self.variant = configuration.variant
         self.kvCacheStrategy = configuration.kvCacheStrategy
@@ -167,7 +168,7 @@ public struct CoreAILanguageModel: LanguageModel {
         self.thinkingFormat = thinkingFormat
         self.toolCallDetection = toolCallDetection
         self.supportsToolCalling = toolCallDetection != nil
-        self.supportsReasoning = {
+        self.supportsReasoning = declaredThinking != nil || {
             switch thinkingFormat {
             case .agentic: return true
             case .tagPair(let open, _): return tokenizer.vocabContains(open)
@@ -308,6 +309,8 @@ public struct CoreAILanguageModel: LanguageModel {
                         model: model,
                         schema: schema,
                         promptTokens: promptTokens,
+                        thinks: model.supportsReasoning
+                            && Self.reasoningTemplateContext(reasoningEffort)["enable_thinking"] as? Bool == true,
                         samplingConfig: effectiveSamplingConfig,
                         maxTokens: maxTokens,
                         channel: channel
@@ -525,10 +528,18 @@ public struct CoreAILanguageModel: LanguageModel {
             model: CoreAILanguageModel,
             schema: GenerationSchema,
             promptTokens: [Int],
+            thinks: Bool,
             samplingConfig: SamplingConfiguration,
             maxTokens: Int,
             channel: LanguageModelExecutorGenerationChannel
         ) async throws {
+            // The grammar constrains only what follows the thought.
+            let thought =
+                thinks
+                ? try await think(
+                    engine: engine, model: model, promptTokens: promptTokens,
+                    samplingConfig: samplingConfig, channel: channel)
+                : []
             let schemaData = try JSONEncoder().encode(schema)
 
             guard let jsonSchema = String(data: schemaData, encoding: .utf8) else {
@@ -551,7 +562,7 @@ public struct CoreAILanguageModel: LanguageModel {
             )
 
             let stream = try await strategy.decode(
-                from: .tokens(promptTokens),
+                from: .tokens(promptTokens + thought),
                 tokenizer: model.tokenizer,
                 inferenceEngine: engine,
                 samplingConfiguration: samplingConfig,
@@ -573,14 +584,64 @@ public struct CoreAILanguageModel: LanguageModel {
                     action: .updateUsage(
                         input: .init(totalTokenCount: promptTokens.count, cachedTokenCount: 0),
                         output: .init(
-                            totalTokenCount: generatedTokenCount,
-                            reasoningTokenCount: 0
+                            totalTokenCount: thought.count + generatedTokenCount,
+                            reasoningTokenCount: thought.count
                         )
                     )))
 
             // Yield to let the engine's tokenSequence Task finish cleanup
             // (putBackEngine, state reset, etc.) before the next respond().
             await Task.yield()
+        }
+
+        /// Most tokens a thought may take before it is closed, whatever the response limit is.
+        private static let thinkingTokenBudget = 2048
+
+        /// Lets the model reason without the grammar and returns the thought's tokens, closing
+        /// marker included, for constrained generation to continue from. Empty when the model opens
+        /// no thought. The thought is reported as reasoning only: `makeTokens` leaves it out of
+        /// every later prompt.
+        private func think(
+            engine: any InferenceEngine,
+            model: CoreAILanguageModel,
+            promptTokens: [Int],
+            samplingConfig: SamplingConfiguration,
+            channel: LanguageModelExecutorGenerationChannel
+        ) async throws -> [Int] {
+            let tokenizer = model.tokenizer
+            guard case .tagPair(let open, let close) = model.thinkingFormat,
+                let openToken = tokenizer.encode(text: open, addSpecialTokens: false).first,
+                case let closeTokens = tokenizer.encode(text: close, addSpecialTokens: false),
+                closeTokens.count == 1, let closeToken = closeTokens.first
+            else { return [] }
+
+            let tokenStream = try await engine.generate(
+                with: promptTokens.map(Int32.init),
+                samplingConfiguration: samplingConfig,
+                inferenceOptions: InferenceOptions(maxTokens: Self.thinkingTokenBudget)
+            )
+            var thought: [Int] = []
+            for try await output in tokenStream {
+                let token = Int(output.tokenId)
+                if thought.isEmpty && token != openToken {
+                    tokenStream.setStopReason(.stopSequence(open))
+                    return []
+                }
+                thought.append(token)
+                if token == closeToken {
+                    tokenStream.setStopReason(.stopSequence(close))
+                    break
+                }
+            }
+            if thought.last != closeToken { thought.append(closeToken) }
+
+            var parser = ThinkTagParser(format: model.thinkingFormat)
+            for case .reasoning(let text) in parser.consume(tokenizer.decode(tokens: thought)) + parser.flush() {
+                await channel.send(.reasoning(action: .appendText(text, tokenCount: thought.count)))
+            }
+            // Let the engine's tokenSequence Task finish cleanup before the next generate().
+            await Task.yield()
+            return thought
         }
 
         // MARK: - Transcript → Tokens
