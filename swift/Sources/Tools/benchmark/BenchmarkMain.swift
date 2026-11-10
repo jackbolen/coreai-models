@@ -74,11 +74,60 @@ struct LLMBenchmark: AsyncParsableCommand {
     )
     var batchSize: Int?
 
+    @Option(
+        name: .customLong("prompt-file"),
+        help:
+            "Use this text file, tokenized, as the prompt instead of random tokens. The whole file is used and --prompt-tokens is ignored."
+    )
+    var promptFile: String?
+
+    @Flag(
+        name: .customLong("chat-template"),
+        help: "With --prompt-file: wrap the text as a user message in the model's chat template.")
+    var chatTemplate: Bool = false
+
+    @Flag(
+        name: .customLong("speculative"),
+        help:
+            "Greedy self-speculative decoding with the bundle's draft head (its 'drafter' component). Needs a static-shape model exported with --emit-hidden-states. Draft acceptance depends on the text, so measure it with --prompt-file rather than the random default prompt."
+    )
+    var speculative: Bool = false
+
+    @Option(
+        name: .customLong("num-draft-tokens"),
+        help:
+            "With --speculative: tokens drafted per step, 1 to \(SpeculativeDefaults.maxDraftTokens) (default: one less than the verify tile is wide)."
+    )
+    var numDraftTokens: Int?
+
+    @Option(
+        name: .customLong("drafter-top-k"),
+        help:
+            "With --speculative: centroids whose candidates the draft head's scan scores (default: \(DraftScan.defaultTopK))."
+    )
+    var drafterTopK: Int?
+
     func validate() throws {
         if promptTokens < 1 { throw ValidationError("--prompt-tokens must be >= 1") }
         if generationTokens < 1 { throw ValidationError("--generation-tokens must be >= 1") }
         if numTrials < 1 { throw ValidationError("--num-trials must be >= 1") }
         if let b = batchSize, b < 1 { throw ValidationError("--batch-size must be >= 1") }
+        if let problem = SpeculativeDecodingOptions.draftCountProblem(numDraftTokens)
+            ?? SpeculativeDecodingOptions.draftHeadProblem(
+                draftHead: speculative, draftModel: false, drafterTopK: drafterTopK)
+        {
+            throw ValidationError(problem)
+        }
+        if let promptFile {
+            if !FileManager.default.fileExists(atPath: NSString(string: promptFile).expandingTildeInPath) {
+                throw ValidationError("Prompt file not found: \(promptFile)")
+            }
+            if (batchSize ?? 1) > 1 { throw ValidationError("--prompt-file does not combine with --batch-size") }
+        } else if chatTemplate {
+            throw ValidationError("--chat-template needs --prompt-file")
+        }
+        if numDraftTokens != nil && !speculative { throw ValidationError("--num-draft-tokens needs --speculative") }
+        if speculative && (batchSize ?? 1) > 1 { throw ValidationError("--speculative does not combine with --batch-size") }
         if !FileManager.default.fileExists(atPath: model) {
             throw ValidationError("Model path not found: \(model)")
         }
@@ -128,8 +177,27 @@ struct LLMBenchmark: AsyncParsableCommand {
         let cacheSuffix = cacheHit ? " (cache hit)" : ""
         print(" done in \(fmt(prepareSeconds))s\(cacheSuffix)")
 
-        let prompt = randomPrompt(vocabSize: vocabSize, count: promptTokens, seed: seed)
+        let prompt: [Int32]
+        if let promptFile {
+            let text = try String(contentsOfFile: NSString(string: promptFile).expandingTildeInPath, encoding: .utf8)
+            let tokens = try PromptUtils.maybeApplyTokenizerChatTemplate(
+                chatTemplate ? .prompt(text) : .rawText(text), tokenizer: try await bundle.loadTokenizer())
+            prompt = tokens.map { Int32($0) }
+        } else {
+            prompt = randomPrompt(vocabSize: vocabSize, count: promptTokens, seed: seed)
+        }
         let sampling = SamplingConfiguration(temperature: 0)
+
+        var decoder: SpeculativeDecoder?
+        if speculative {
+            guard let target = engine as? StaticShapeEngine else {
+                throw ValidationError("--speculative needs the static-shape engine (got \(type(of: engine))).")
+            }
+            decoder = try await EngineFactory.createSpeculativeDecoder(
+                target: target, bundle: bundle,
+                options: EngineFactory.DraftHeadOptions(draftTokens: numDraftTokens, drafterTopK: drafterTopK))
+            print("🔮 Speculative decoding: draft head, k=\(decoder?.numDraftTokens ?? 0), greedy")
+        }
 
         // A dynamic-batch graph's batch dimension is symbolic and detects as 1, so it needs an
         // explicit --batch-size.
@@ -151,6 +219,9 @@ struct LLMBenchmark: AsyncParsableCommand {
         }
 
         func oneTrial() async throws -> TrialResult {
+            if let decoder {
+                return try await runSpeculativeTrial(decoder: decoder, prompt: prompt)
+            }
             if effectiveBatch > 1, let seq = engine as? CoreAISequentialEngine {
                 return try await runBatchedTrial(engine: seq, prompt: prompt, batchSize: effectiveBatch)
             }
@@ -166,7 +237,7 @@ struct LLMBenchmark: AsyncParsableCommand {
         print(" done in \(fmt(warmupSeconds))s")
 
         // Timed trials
-        print("\n🔄 Benchmarking with \(promptTokens) prompt tokens, \(generationTokens) generation tokens\n")
+        print("\n🔄 Benchmarking with \(prompt.count) prompt tokens, \(generationTokens) generation tokens\n")
         var trials: [TrialResult] = []
 
         for i in 0..<numTrials {
@@ -176,6 +247,9 @@ struct LLMBenchmark: AsyncParsableCommand {
             print("🧪 Trial \(i + 1)")
             print("⚡ Prompt:     \(fmt(r.promptTps)) tokens/sec")
             print("🏃 Generation: \(fmt(r.genTps)) tokens/sec")
+            if let rate = r.acceptanceRate, let perPass = r.tokensPerTargetPass {
+                print("🎯 Draft accepted: \(fmt(rate * 100))%, \(fmt(perPass)) tokens per target pass")
+            }
         }
 
         let n = Double(trials.count)
@@ -190,12 +264,18 @@ struct LLMBenchmark: AsyncParsableCommand {
         }
         print("Prompt:     \(fmt(avgPrompt)) tokens/sec")
         print("Generation: \(fmt(avgGen)) tokens/sec")
+        if decoder != nil {
+            let rates = trials.compactMap(\.acceptanceRate)
+            let perPass = trials.compactMap(\.tokensPerTargetPass)
+            print("Accepted:   \(fmt(rates.reduce(0, +) / Double(max(1, rates.count)) * 100))% of drafts, "
+                + "\(fmt(perPass.reduce(0, +) / Double(max(1, perPass.count)))) tokens per target pass")
+        }
         print(String(repeating: "=", count: 50))
 
         if let path = outputJson {
             let report = BenchmarkReport(
                 model: bundle.name,
-                promptTokens: promptTokens,
+                promptTokens: prompt.count,
                 generationTokens: generationTokens,
                 numTrials: numTrials,
                 batchSize: effectiveBatch,
@@ -246,6 +326,28 @@ struct LLMBenchmark: AsyncParsableCommand {
         let genTps = genTime > 0 ? Double(decodeCount) / genTime : 0
 
         return TrialResult(promptTps: promptTps, genTps: genTps)
+    }
+
+    /// One greedy speculative generation. The prompt rate is the time to the first emitted token, which
+    /// includes the prefill, and the generation rate is every token after it.
+    private func runSpeculativeTrial(decoder: SpeculativeDecoder, prompt: [Int32]) async throws -> TrialResult {
+        try? await Task.sleep(for: .milliseconds(50))
+        let start = SuspendingClock.now
+        var firstToken: SuspendingClock.Instant?
+        var count = 0
+        let stats = try await decoder.generateGreedy(
+            promptTokens: prompt, maxNewTokens: generationTokens, stopTokenIds: []
+        ) { _ in
+            if firstToken == nil { firstToken = .now }
+            count += 1
+        }
+        guard let firstToken else { return TrialResult(promptTps: 0, genTps: 0) }
+        let promptTime = seconds(from: start, to: firstToken)
+        let genTime = seconds(from: firstToken, to: .now)
+        return TrialResult(
+            promptTps: promptTime > 0 ? Double(prompt.count) / promptTime : 0,
+            genTps: genTime > 0 ? Double(max(0, count - 1)) / genTime : 0,
+            acceptanceRate: stats.acceptanceRate, tokensPerTargetPass: stats.meanTokensPerTargetPass)
     }
 
     /// Runs `batchSize` copies of the prompt as one batch. Rates are totals across rows. No EOS is
@@ -312,6 +414,9 @@ struct LLMBenchmark: AsyncParsableCommand {
 struct TrialResult: Codable {
     let promptTps: Double
     let genTps: Double
+    /// Speculative runs only.
+    var acceptanceRate: Double?
+    var tokensPerTargetPass: Double?
 }
 
 struct BenchmarkReport: Codable {

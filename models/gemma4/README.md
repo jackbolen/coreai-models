@@ -226,6 +226,12 @@ swift run -c release llm-benchmark --model path/to/exported_model_folder
 
 Defaults: 512 prompt tokens, 1024 generation tokens, 5 trials. Override with `-p`, `-g`, and `-n`.
 
+The prompt is random tokens unless `--prompt-file` names a text file, which becomes the whole prompt
+(add `--chat-template` to send it as a user message). `--speculative` decodes with the bundle's draft
+head, as under [Draft head](#draft-head-speculative-decoding), and also reports how many drafts the
+target accepted; `--num-draft-tokens` and `--drafter-top-k` tune it. How many drafts are accepted
+depends on the text, so measure it with `--prompt-file`.
+
 ## Evaluation
 
 | HF ID | MMLU (BF16) | MMLU (4-bit palettized, 8-bit PLE) |
