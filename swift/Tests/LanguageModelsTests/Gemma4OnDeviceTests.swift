@@ -133,24 +133,50 @@ struct Gemma4OnDeviceTests {
             .joined()
     }
 
-    @Test("Requests that branch from a shared transcript resume from it and match cold runs")
-    func branchesMatchCold() async throws {
-        let cached = try await CoreAIRunner(contentsOf: Self.bundleURL).makeInferenceEngine()
-        // The reference keeps no prefix: its budget leaves no block and no snapshot behind.
-        let cold = try await EngineFactory.createEngine(
-            bundle: LanguageModelBundle(at: Self.bundleURL), options: EngineOptions(prefixCacheBudgetBytes: 0))
-        let tokenizer = try await LanguageModelBundle(at: Self.bundleURL).loadTokenizer()
+    /// An engine that keeps prefixes beside a reference that keeps none, over one bundle, and the
+    /// requests both of them run.
+    private struct BranchRig {
+        let cached: any InferenceEngine
+        /// Its budget leaves no block and no snapshot behind, so it replays every token.
+        let reference: any InferenceEngine
+        let tokenizer: any Tokenizer
+        let instructions: String
+
+        init(
+            bundleURL: URL, instructions: String = String(Gemma4OnDeviceTests.rules.prefix(6_000)),
+            budgetBytes: Int = EngineOptions.defaultPrefixCacheBudgetBytes
+        ) async throws {
+            let bundle = try LanguageModelBundle(at: bundleURL)
+            cached = try await EngineFactory.createEngine(
+                bundle: bundle, options: EngineOptions(prefixCacheBudgetBytes: budgetBytes))
+            reference = try await EngineFactory.createEngine(
+                bundle: bundle, options: EngineOptions(prefixCacheBudgetBytes: 0))
+            tokenizer = try await bundle.loadTokenizer()
+            self.instructions = instructions
+        }
+
+        struct Outcome {
+            let seconds: Double
+            let referenceSeconds: Double
+            /// The tokens of the prompt that the engine matched against what it kept.
+            let matchedTokens: Int
+
+            func expectResumes(_ name: String) {
+                #expect(seconds * 1.5 < referenceSeconds, "\(name)")
+            }
+        }
 
         func prompt(_ transcript: String) throws -> [Int32] {
             try tokenizer.applyChatTemplate(messages: [
-                ["role": "system", "content": String(Self.rules.prefix(6_000))],
-                ["role": "user", "content": transcript],
+                ["role": "system", "content": instructions], ["role": "user", "content": transcript],
             ]).map(Int32.init)
         }
+
         /// Tokens that two prompts continuing `transcript` differently share.
         func end(of transcript: String) throws -> Int {
             zip(try prompt(transcript + "Alpha"), try prompt(transcript + "Beta")).prefix { $0 == $1 }.count
         }
+
         func firstLogits(
             _ engine: any InferenceEngine, _ input: [Int32], declaring lengths: [Int] = []
         ) async throws -> (logits: [Float], seconds: Double) {
@@ -164,22 +190,41 @@ struct Gemma4OnDeviceTests {
             }
             return ([], 0)
         }
-        func coldLogits(_ input: [Int32]) async throws -> (logits: [Float], seconds: Double) {
-            try await cold.reset()
-            return try await firstLogits(cold, input)
+
+        /// Warms both engines' graphs, so that the timings after it compare prefill alone.
+        func warmUp() async throws {
+            _ = try await firstLogits(cached, prompt("warm up"))
+            try await reference.reset()
+            _ = try await firstLogits(reference, prompt("warm up"))
         }
 
+        /// Sends `transcript` to both engines and expects the logits of the first token to agree.
+        func run(_ name: String, _ transcript: String, declaring lengths: [Int] = []) async throws -> Outcome {
+            let input = try prompt(transcript)
+            let resumed = try await firstLogits(cached, input, declaring: lengths)
+            let matched = cached.lastPrefixHitCount
+            try await reference.reset()
+            let cold = try await firstLogits(reference, input)
+            print(
+                "\(name): resumed \(resumed.seconds) s, cold \(cold.seconds) s, "
+                    + "\(matched) of \(input.count) tokens matched")
+            #expect(cold.logits.count > 1_000, "\(name)")
+            #expect(zip(resumed.logits, cold.logits).map { abs($0 - $1) }.max() ?? .infinity < 0.05, "\(name)")
+            return Outcome(seconds: resumed.seconds, referenceSeconds: cold.seconds, matchedTokens: matched)
+        }
+    }
+
+    @Test("Requests that branch from a shared transcript resume from it and match cold runs")
+    func branchesMatchCold() async throws {
+        let rig = try await BranchRig(bundleURL: Self.bundleURL)
         let (base, mainOne, mainTwo, fork, sibling) = (
             Self.transcript("history"), Self.transcript("main one"), Self.transcript("main two"),
             Self.transcript("fork"), Self.transcript("sibling")
         )
-        let baseEnd = try end(of: base)
-        let mainOneEnd = try end(of: base + mainOne)
-        let mainTwoEnd = try end(of: base + mainOne + mainTwo)
-
-        // Warm both engines' graphs so that the timings below compare prefill alone.
-        _ = try await firstLogits(cached, prompt("warm up"))
-        _ = try await coldLogits(prompt("warm up"))
+        let baseEnd = try rig.end(of: base)
+        let mainOneEnd = try rig.end(of: base + mainOne)
+        let mainTwoEnd = try rig.end(of: base + mainOne + mainTwo)
+        try await rig.warmUp()
 
         let requests: [(name: String, transcript: String, declared: [Int])] = [
             ("main", base + "Alpha", [baseEnd]),
@@ -189,17 +234,118 @@ struct Gemma4OnDeviceTests {
             ("sibling of the fork", base + sibling + "Alpha", [baseEnd]),
         ]
         for request in requests {
-            let input = try prompt(request.transcript)
-            let resumed = try await firstLogits(cached, input, declaring: request.declared)
-            let reference = try await coldLogits(input)
-            print(
-                "\(request.name): resumed \(resumed.seconds) s, cold \(reference.seconds) s, "
-                    + "\(cached.lastPrefixHitCount) of \(input.count) tokens matched")
-            #expect(reference.logits.count > 1_000)
-            #expect(zip(resumed.logits, reference.logits).map { abs($0 - $1) }.max() ?? .infinity < 0.05)
+            let outcome = try await rig.run(request.name, request.transcript, declaring: request.declared)
             // The first request has nothing to resume from; every other one skips most of its prompt.
-            if request.name != "main" { #expect(resumed.seconds * 1.5 < reference.seconds, "\(request.name)") }
+            if request.name != "main" { outcome.expectResumes(request.name) }
         }
+    }
+
+    @Test("A fork that leaves the main line mid-stretch gives its siblings a point to resume from")
+    func junctionServesSiblings() async throws {
+        let rig = try await BranchRig(bundleURL: Self.bundleURL)
+        let (base, mainOne, mainTwo) = (
+            Self.transcript("history"), Self.transcript("main one"), Self.transcript("main two")
+        )
+        // The first half of the main line's second stretch: all that a fork of it inherits.
+        let inherited = Self.transcript("main two", lines: 25)
+        let baseEnd = try rig.end(of: base)
+        let mainOneEnd = try rig.end(of: base + mainOne)
+        let mainTwoEnd = try rig.end(of: base + mainOne + mainTwo)
+        try await rig.warmUp()
+
+        _ = try await rig.run("main", base + "Alpha", declaring: [baseEnd])
+        _ = try await rig.run("main continues", base + mainOne + "Alpha", declaring: [baseEnd, mainOneEnd])
+        _ = try await rig.run(
+            "main again", base + mainOne + mainTwo + "Alpha", declaring: [baseEnd, mainOneEnd, mainTwoEnd])
+
+        // Neither fork knows where it leaves the main line: they declare only the Add ends they share.
+        let fork = base + mainOne + inherited
+        let first = try await rig.run(
+            "first fork", fork + Self.transcript("fork a") + "Alpha", declaring: [baseEnd, mainOneEnd])
+        let sibling = try await rig.run(
+            "sibling", fork + Self.transcript("fork b") + "Alpha", declaring: [baseEnd, mainOneEnd])
+        first.expectResumes("first fork")
+        sibling.expectResumes("sibling")
+        // The first fork took a snapshot where it left the main line; the sibling resumes from it.
+        #expect(sibling.matchedTokens > first.matchedTokens)
+    }
+
+    @Test("A fork of a fork resumes from its parent, and the main line resumes after them")
+    func forksOfForksInterleaveWithMain() async throws {
+        let rig = try await BranchRig(bundleURL: Self.bundleURL)
+        let (base, mainOne, mainTwo, forkA, forkB, forkC) = (
+            Self.transcript("history"), Self.transcript("main one"), Self.transcript("main two"),
+            Self.transcript("fork a"), Self.transcript("fork b"), Self.transcript("fork c")
+        )
+        let baseEnd = try rig.end(of: base)
+        let mainOneEnd = try rig.end(of: base + mainOne)
+        let mainTwoEnd = try rig.end(of: base + mainOne + mainTwo)
+        let forkAEnd = try rig.end(of: base + mainOne + forkA)
+        let forkBEnd = try rig.end(of: base + mainOne + forkA + forkB)
+        try await rig.warmUp()
+
+        let shared = [baseEnd, mainOneEnd]
+        let requests: [(name: String, transcript: String, declared: [Int])] = [
+            ("main", base + "Alpha", [baseEnd]),
+            ("main continues", base + mainOne + "Alpha", shared),
+            ("fork", base + mainOne + forkA + "Alpha", shared + [forkAEnd]),
+            ("fork of the fork", base + mainOne + forkA + forkB + "Alpha", shared + [forkAEnd, forkBEnd]),
+            ("main after the forks", base + mainOne + mainTwo + "Alpha", shared + [mainTwoEnd]),
+            ("sibling of the fork of the fork", base + mainOne + forkA + forkC + "Alpha", shared + [forkAEnd]),
+            ("fork of the fork again", base + mainOne + forkA + forkB + "Beta", shared + [forkAEnd, forkBEnd]),
+        ]
+        for request in requests {
+            let outcome = try await rig.run(request.name, request.transcript, declaring: request.declared)
+            if request.name != "main" { outcome.expectResumes(request.name) }
+        }
+    }
+
+    @Test("A restore that needs a larger context bucket than the live caches hold grows it")
+    func restoreGrowsTheContextBucket() async throws {
+        let rig = try await BranchRig(bundleURL: Self.bundleURL, instructions: "Answer the question about the log.")
+        let history = Self.transcript("history", lines: 200)
+        let historyEnd = try rig.end(of: history)
+        try await rig.warmUp()
+
+        _ = try await rig.run("long", history + "Alpha", declaring: [historyEnd])
+        // A prompt of a few dozen tokens shrinks the live caches to the smallest context bucket.
+        _ = try await rig.run("short", "Is item 14 risky?")
+        let grown = try await rig.run("long again", history + "Beta", declaring: [historyEnd])
+        // The resume point lies past the smallest bucket, which holds 1024 tokens.
+        #expect(grown.matchedTokens > 1_024)
+        grown.expectResumes("long again")
+    }
+
+    @Test("Under a budget that holds almost nothing, requests still match cold runs and the first snapshot stays")
+    func evictionKeepsThePinnedSnapshot() async throws {
+        let rig = try await BranchRig(bundleURL: Self.bundleURL, budgetBytes: 4_000_000)
+        let (base, mainOne, mainTwo, fork, sibling) = (
+            Self.transcript("history"), Self.transcript("main one"), Self.transcript("main two"),
+            Self.transcript("fork"), Self.transcript("sibling")
+        )
+        let baseEnd = try rig.end(of: base)
+        let mainOneEnd = try rig.end(of: base + mainOne)
+        let mainTwoEnd = try rig.end(of: base + mainOne + mainTwo)
+        try await rig.warmUp()
+
+        let requests: [(name: String, transcript: String, declared: [Int])] = [
+            ("main", base + "Alpha", [baseEnd]),
+            ("main continues", base + mainOne + "Alpha", [baseEnd, mainOneEnd]),
+            ("fork", base + fork + "Alpha", [baseEnd]),
+            ("main after the fork", base + mainOne + mainTwo + "Alpha", [baseEnd, mainOneEnd, mainTwoEnd]),
+            ("sibling of the fork", base + sibling + "Alpha", [baseEnd]),
+        ]
+        for request in requests {
+            _ = try await rig.run(request.name, request.transcript, declaring: request.declared)
+        }
+
+        // The Add end the main line left behind was evicted, so a request over it resumes from the
+        // first snapshot instead.
+        let evicted = try await rig.run("over an evicted snapshot", base + mainOne + "Gamma", declaring: [baseEnd, mainOneEnd])
+        #expect(evicted.matchedTokens > baseEnd / 2 && evicted.matchedTokens <= baseEnd)
+        let pinned = try await rig.run("over the pinned snapshot", base + Self.transcript("other") + "Alpha", declaring: [baseEnd])
+        #expect(pinned.matchedTokens > baseEnd / 2)
+        pinned.expectResumes("over the pinned snapshot")
     }
 
     @Test("A request resumes from the first segment of its prompt when only the last one changes")
